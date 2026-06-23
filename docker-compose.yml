@@ -1,0 +1,13 @@
+services:
+  xray-checker:
+    build:
+      context: .
+    container_name: xray-checker
+    restart: unless-stopped
+    environment:
+      - SUBSCRIPTION_URL=https://SUBSCRIBE_URL
+      - METRICS_BASE_PATH=/monitor
+      - SPEEDTEST_ENABLED=true
+      - SPEEDTEST_INTERVAL=240
+    ports:
+      - "127.0.0.1:2112:2112"
