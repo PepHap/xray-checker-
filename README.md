@@ -1,5 +1,17 @@
 # Xray Checker
 
+```
+git clone https://github.com/PepHap/xray-checker-.git
+cd xray-checker-
+nano docker-compose.yml   # заменить https://SUBSCRIBE_URL на свою SUBSCRIPTION_URL
+docker compose up -d --build
+```
+
+
+
+
+
+
 <div align="center">
 
 [![GitHub Release](https://img.shields.io/github/v/release/kutovoys/xray-checker?color=blue)](https://github.com/kutovoys/xray-checker/releases/latest)
