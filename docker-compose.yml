@@ -7,6 +7,7 @@ services:
     environment:
       - SUBSCRIPTION_URL=https://SUBSCRIBE_URL
       - METRICS_BASE_PATH=/monitor
+      - PROXY_CHECK_METHOD=status
       - SPEEDTEST_ENABLED=true
       - SPEEDTEST_INTERVAL=240
     ports:
