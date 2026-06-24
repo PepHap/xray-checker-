@@ -5,8 +5,8 @@ Requires=docker.service
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/xray-checker
-ExecStart=/opt/xray-checker/scripts/remna-fail-correlator.sh
+WorkingDirectory=/opt/remnanode/xray-checker-
+ExecStart=/opt/remnanode/xray-checker-/scripts/remna-fail-correlator.sh
 Restart=always
 RestartSec=5
 
