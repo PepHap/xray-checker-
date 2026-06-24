@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
-# Watches xray-checker's container logs for [ERROR] (failed check) lines,
-# resolves the failing proxy's server:port via the checker's own
-# /api/v1/proxies endpoint, then pulls matching lines from remnanode's
-# logs around the same timestamp into a single combined report file.
+# Watches xray-checker's [ERROR] log lines and, for each failure on a proxy
+# hosted on this remnanode, pulls the matching connection's lines out of
+# remnanode's xray debug log (a plain file inside the container, not
+# docker logs) into a single combined report.
 #
-# Usage: CHECKER_CONTAINER=xray-checker REMNA_CONTAINER=remnanode \
-#        ./remna-fail-correlator.sh
-#
-# Tunable via env vars (defaults shown):
+# remnanode's debug log has no client IP/port, so matching is done by the
+# hostname xray-checker actually requests through the proxy (resolved
+# automatically from the running containers) plus the xray connection ID,
+# within a time window around the failure.
 set -euo pipefail
 
 CHECKER_CONTAINER="${CHECKER_CONTAINER:-xray-checker}"
 REMNA_CONTAINER="${REMNA_CONTAINER:-remnanode}"
-CHECKER_API_URL="${CHECKER_API_URL:-http://127.0.0.1:2112/monitor/api/v1/proxies}"
+REMNA_LOG_FILE="${REMNA_LOG_FILE:-/var/log/supervisor/xray.out.log}"
+REMNA_TAIL_LINES="${REMNA_TAIL_LINES:-200000}" # how far back to scan per event
+CHECKER_API_BASE="${CHECKER_API_BASE:-http://127.0.0.1:2112/monitor}"
 OUTPUT_FILE="${OUTPUT_FILE:-/var/log/remna-correlated-errors.log}"
-WINDOW_BEFORE="${WINDOW_BEFORE:-15}" # seconds before the failure to include
-WINDOW_AFTER="${WINDOW_AFTER:-5}"    # seconds after the failure to include
+# PROXY_TIMEOUT/PROXY_DOWNLOAD_TIMEOUT defaults are 30s/60s, so the real
+# request can be well before the moment the failure gets logged.
+WINDOW_BEFORE="${WINDOW_BEFORE:-40}" # seconds before the failure to scan
+WINDOW_AFTER="${WINDOW_AFTER:-5}"    # seconds after the failure to scan
 HOST_FILTER="${HOST_FILTER:-}"       # optional: only correlate if proxy.Server contains this substring/IP
 
-for bin in docker curl jq date; do
+for bin in docker curl jq; do
   command -v "$bin" >/dev/null || { echo "Missing required binary: $bin" >&2; exit 1; }
 done
+
+mkdir -p "$(dirname "$OUTPUT_FILE")"
 
 PROXY_CACHE_FILE="$(mktemp)"
 PROXY_CACHE_TS=0
@@ -30,55 +36,74 @@ refresh_proxy_cache() {
   local now
   now=$(date +%s)
   if (( now - PROXY_CACHE_TS > 60 )) || [[ ! -s "$PROXY_CACHE_FILE" ]]; then
-    if curl -fsS "$CHECKER_API_URL" -o "$PROXY_CACHE_FILE" 2>/dev/null; then
-      PROXY_CACHE_TS=$now
-    fi
+    curl -fsS "$CHECKER_API_BASE/api/v1/proxies" -o "$PROXY_CACHE_FILE" 2>/dev/null \
+      && PROXY_CACHE_TS=$now
   fi
 }
 
-# Echoes "server:port" for a given proxy name, or nothing if not found /
-# if HOST_FILTER is set and the server doesn't match it.
-lookup_server_port() {
+# Echoes "server" for a given proxy name (empty if not found, or if
+# HOST_FILTER is set and the server doesn't match it).
+lookup_server() {
   local name="$1"
   refresh_proxy_cache
   jq -r --arg name "$name" --arg hf "$HOST_FILTER" '
     .data[]? | select(.name == $name)
     | select($hf == "" or (.server | contains($hf)))
-    | "\(.server):\(.port)"
+    | .server
   ' "$PROXY_CACHE_FILE" 2>/dev/null | head -n1
 }
 
-# Converts a "YYYY/MM/DD HH:MM:SS" checker timestamp + offset (seconds,
-# may be negative) into an RFC3339 timestamp docker logs understands.
-to_rfc3339() {
-  local ts="$1" offset="$2"
-  date -d "${ts//\//-} ${offset} seconds" +"%Y-%m-%dT%H:%M:%S"
+# Figures out which hostname xray-checker actually requests through the
+# proxy (depends on PROXY_CHECK_METHOD / the matching *_URL env var).
+detect_check_host() {
+  local method var default url
+  method="$(curl -fsS "$CHECKER_API_BASE/api/v1/config" 2>/dev/null | jq -r '.data.checkMethod // "ip"')"
+  case "$method" in
+    status)   var=PROXY_STATUS_CHECK_URL;   default="http://cp.cloudflare.com/generate_204" ;;
+    download) var=PROXY_DOWNLOAD_URL;       default="https://proof.ovh.net/files/1Mb.dat" ;;
+    *)        var=PROXY_IP_CHECK_URL;       default="https://api.ipify.org?format=text" ;;
+  esac
+  url="$(docker inspect "$CHECKER_CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | grep "^${var}=" | head -n1 | cut -d= -f2-)"
+  [[ -z "$url" ]] && url="$default"
+  url="${url#*://}"; url="${url%%/*}"; url="${url%%\?*}"; url="${url%%:*}"
+  echo "$url"
 }
 
-mkdir -p "$(dirname "$OUTPUT_FILE")"
-echo "Watching ${CHECKER_CONTAINER}, correlating failures with ${REMNA_CONTAINER} -> ${OUTPUT_FILE}"
+CHECK_HOST="$(detect_check_host)"
+echo "Watching ${CHECKER_CONTAINER}; check host through proxy: ${CHECK_HOST:-<unknown>}; correlating with ${REMNA_CONTAINER}:${REMNA_LOG_FILE} -> ${OUTPUT_FILE}"
 
 docker logs -f --since 0s "$CHECKER_CONTAINER" 2>&1 | while IFS= read -r line; do
-  if [[ "$line" =~ ^([0-9]{4}/[0-9]{2}/[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2})\ \[ERROR\]\ ([^|]+)\|\ ?(.+)$ ]]; then
-    ts="${BASH_REMATCH[1]}"
-    name="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"${BASH_REMATCH[2]}")"
-    detail="${BASH_REMATCH[3]}"
+  [[ "$line" =~ ^([0-9]{4}/[0-9]{2}/[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2})\ \[ERROR\]\ ([^|]+)\|\ ?(.+)$ ]] || continue
+  ts="${BASH_REMATCH[1]}"
+  name="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"${BASH_REMATCH[2]}")"
+  detail="${BASH_REMATCH[3]}"
 
-    server_port="$(lookup_server_port "$name")"
-    [[ -z "$server_port" ]] && continue # not our proxy / on another host
+  server="$(lookup_server "$name")"
+  [[ -z "$server" ]] && continue # not a proxy on this remnanode
 
-    port="${server_port##*:}"
-    since_ts="$(to_rfc3339 "$ts" "-${WINDOW_BEFORE}")"
-    until_ts="$(to_rfc3339 "$ts" "+${WINDOW_AFTER}")"
+  since_ts="$(date -d "${ts//\//-} -${WINDOW_BEFORE} seconds" +"%Y/%m/%d %H:%M:%S")"
+  until_ts="$(date -d "${ts//\//-} +${WINDOW_AFTER} seconds" +"%Y/%m/%d %H:%M:%S")"
 
-    {
-      echo "===== FAILED ${ts} | ${name} (${server_port}) | ${detail} ====="
-      echo "--- ${REMNA_CONTAINER} logs, ${since_ts} .. ${until_ts}, matching :${port} ---"
-      docker logs --since "$since_ts" --until "$until_ts" "$REMNA_CONTAINER" 2>&1 \
-        | grep -F ":${port}" || echo "(нет совпадений по порту в этом окне)"
-      echo
-    } >> "$OUTPUT_FILE"
+  window="$(docker exec "$REMNA_CONTAINER" tail -n "$REMNA_TAIL_LINES" "$REMNA_LOG_FILE" 2>/dev/null \
+    | awk -v s="$since_ts" -v e="$until_ts" '{ts=substr($0,1,19); if (ts>=s && ts<=e) print}')"
 
-    echo "[correlated] ${ts} ${name} -> ${OUTPUT_FILE}"
-  fi
+  {
+    echo "===== FAILED ${ts} | ${name} (${server}) | ${detail} ====="
+    req_line=""
+    if [[ -n "$CHECK_HOST" && -n "$window" ]]; then
+      req_line="$(grep -F "received request for" <<<"$window" | grep -F "$CHECK_HOST" | tail -n1 || true)"
+    fi
+    if [[ -n "$req_line" ]]; then
+      conn_id="$(grep -oE '\[[0-9]+\]' <<<"$req_line" | head -n1)"
+      echo "--- matched check connection ${conn_id} (host: ${CHECK_HOST}) ---"
+      grep -F "$conn_id" <<<"$window"
+    else
+      echo "--- no request to '${CHECK_HOST:-?}' found in window; raw remnanode lines for ${since_ts}..${until_ts} (may include other clients) ---"
+      if [[ -n "$window" ]]; then printf '%s\n' "$window"; else echo "(remnanode log file has nothing in this window — check REMNA_TAIL_LINES / log rotation)"; fi
+    fi
+    echo
+  } >> "$OUTPUT_FILE"
+
+  echo "[correlated] ${ts} ${name} -> ${OUTPUT_FILE}"
 done
