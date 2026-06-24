@@ -5,9 +5,8 @@ Requires=docker.service
 
 [Service]
 Type=simple
-# Adjust to wherever this repo actually lives on the host.
-WorkingDirectory=/opt/xray-checker-
-ExecStart=/opt/xray-checker-/scripts/remna-fail-correlator.sh
+WorkingDirectory=/opt/xray-checker
+ExecStart=/opt/xray-checker/scripts/remna-fail-correlator.sh
 Restart=always
 RestartSec=5
 
