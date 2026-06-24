@@ -82,8 +82,9 @@ docker logs -f --since 0s "$CHECKER_CONTAINER" 2>&1 | while IFS= read -r line; d
   server="$(lookup_server "$name")"
   [[ -z "$server" ]] && continue # not a proxy on this remnanode
 
-  since_ts="$(date -d "${ts//\//-} -${WINDOW_BEFORE} seconds" +"%Y/%m/%d %H:%M:%S")"
-  until_ts="$(date -d "${ts//\//-} +${WINDOW_AFTER} seconds" +"%Y/%m/%d %H:%M:%S")"
+  ts_epoch="$(date -d "${ts//\//-}" +%s)"
+  since_ts="$(date -d "@$((ts_epoch - WINDOW_BEFORE))" +"%Y/%m/%d %H:%M:%S")"
+  until_ts="$(date -d "@$((ts_epoch + WINDOW_AFTER))" +"%Y/%m/%d %H:%M:%S")"
 
   window="$(docker exec "$REMNA_CONTAINER" tail -n "$REMNA_TAIL_LINES" "$REMNA_LOG_FILE" 2>/dev/null \
     | awk -v s="$since_ts" -v e="$until_ts" '{ts=substr($0,1,19); if (ts>=s && ts<=e) print}')"
