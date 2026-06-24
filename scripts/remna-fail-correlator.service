@@ -1,0 +1,21 @@
+[Unit]
+Description=Correlate xray-checker failures with remnanode debug log
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+# Adjust to wherever this repo actually lives on the host.
+WorkingDirectory=/opt/xray-checker-
+ExecStart=/opt/xray-checker-/scripts/remna-fail-correlator.sh
+Restart=always
+RestartSec=5
+
+# Uncomment / adjust as needed (see script header for the full list):
+# Environment=CHECKER_CONTAINER=xray-checker
+# Environment=REMNA_CONTAINER=remnanode
+# Environment=HOST_FILTER=203.0.113.10
+# Environment=OUTPUT_FILE=/var/log/remna-correlated-errors.log
+
+[Install]
+WantedBy=multi-user.target
